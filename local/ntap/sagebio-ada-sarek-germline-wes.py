@@ -1,7 +1,51 @@
 """https://sagebionetworks.jira.com/browse/EAGER-germline-1
-This workflow was created to run the `nf-core/sarek` pipeline for GRCh38 Whole Exome Sequencing (WES) germline variant calling.
+Orca recipe to run the `nf-core/sarek` pipeline for GRCh38 Whole Exome Sequencing (WES) germline variant calling.
+
+Orchestrates four steps:
+  1. stage_samplesheet   : Download samplesheet from Synapse and upload to S3
+  2. nf-synapse SYNSTAGE : Download FASTQ files from Synapse to S3
+  3. nf-core/sarek       : Run germline variant calling
+  4. nf-synapse SYNINDEX : Index results back to Synapse
+
+Prerequisites:
+  - pip install py-orca
+  - AWS credentials configured (profile: tower)
+  - SYNAPSE_AUTH_TOKEN set in Tower workspace secrets (not user secret)
+    (shared group Synapse token — authenticates the workflow to Synapse;
+     manage at https://tower.sagebionetworks.org/orgs/Sage-Bionetworks/workspaces/ntap-add5-project/secrets)
+
+Setup:
+  Get your Tower personal access token at tower.sagebionetworks.org → Your tokens,
+  then export the following before running:
+
+    export TOWER_ACCESS_TOKEN="<your_tower_token>"
+    export TOWER_WORKSPACE="sage-bionetworks/ntap-add5-project"
+    export TOWER_API_ENDPOINT="https://tower.sagebionetworks.org/api"
+    export NEXTFLOWTOWER_CONNECTION_URI="https://:<your_tower_token>@tower.sagebionetworks.org/api?workspace=sage-bionetworks%2Fntap-add5-project"
+
+Usage:
+  # Run all steps (default)
+  python sagebio-ada-sarek-germline-wes.py
+  python sagebio-ada-sarek-germline-wes.py --run-number 2 # with a specific run number
+
+
+  # Run individual steps (e.g. stage_samplesheet, synstage, process, synindex)
+  python sagebio-ada-sarek-germline-wes.py stage_samplesheet
+  python sagebio-ada-sarek-germline-wes.py synstage
+  python sagebio-ada-sarek-germline-wes.py process
+  python sagebio-ada-sarek-germline-wes.py synindex
+
+  # Run multiple steps (e.g. synstage + process)
+  python sagebio-ada-sarek-germline-wes.py synstage process
+  python sagebio-ada-sarek-germline-wes.py synstage process --run-number 2 # with a specific run number
+
+  # Rerun with a new version number to preserve previous S3 outputs
+  # Default is --run-number 1; increment each time you need a clean rerun
+  python sagebio-ada-sarek-germline-wes.py process --run-number 2
+  python sagebio-ada-sarek-germline-wes.py synindex --run-number 2
 """
 import asyncio
+import argparse
 from dataclasses import dataclass
 
 import boto3
@@ -11,15 +55,16 @@ from synapseclient import Synapse
 
 session = boto3.Session(profile_name="tower")
 s3 = session.client("s3")
-import argparse
+
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('step', nargs='*', default = 'all',help='Processing step (Default: all)')
+    parser.add_argument('step', nargs='*', default='all', help='Processing step (Default: all)')
+    parser.add_argument('--run-number', type=int, default=1, help='Run version number (Default: 1). Increment to preserve previous outputs.')
     args = parser.parse_args()
-    
+
     ops = NextflowTowerOps()
-    datasets = generate_datasets()
+    datasets = generate_datasets(run_number=args.run_number)
     runs = [run_workflows(ops, dataset, args.step) for dataset in datasets]
     statuses = await asyncio.gather(*runs)
     print(statuses)
@@ -36,18 +81,25 @@ class Dataset:
     synapse_id_for_output: str
     """The synapse id for the output folder, this is where the output will be uploaded to."""
 
-    run_number: int
-    """The number for the run, this is used to generate the run_name for the workflow."""
-
-    output_number: int
-    """The number for the output, in some cases this is the same as the run_number, 
-    but in other cases it isn't because the pipeline has been re-ran."""
-
     bucket_name: str
     """The name of the bucket to stage the samplesheet in."""
 
     staging_key: str
     """The key in the S3 bucket where this workflow is going to run."""
+
+    institution: str
+    """The institution that generated the samples ('JH' or 'WU'). Determines the BED file used."""
+
+    run_number: int = 1
+    """Run version number. Passed from CLI --run-number; increment to preserve previous outputs."""
+
+    @property
+    def intervals(self) -> str:
+        """The S3 uri for the BED file, determined by institution."""
+        if self.institution == "JH":
+            return BED_JH
+        elif self.institution == "WU":
+            return BED_WU
 
     @property
     def samplesheet_location(self) -> str:
@@ -78,7 +130,7 @@ class Dataset:
     def output_directory(self) -> str:
         """The S3 uri where the output is going to be uploaded to. The is used as the
         input for the synindex workflow."""
-        return f"s3://{self.bucket_name}/outputs/sarek_GRCh38_{self.id}_{self.output_number}/"
+        return f"s3://{self.bucket_name}/outputs/sarek_GRCh38_{self.id}_{self.run_number}/"
 
     @property
     def synstage_run_name(self) -> str:
@@ -96,29 +148,92 @@ class Dataset:
         return f"synindex_{self.id}_{self.run_number}"
 
 
-def generate_datasets() -> list[Dataset]:
+# BED files for exome seq data from JHU NF1 repository - different batches/institutions
+BED_JH = "s3://ntap-add5-project-tower-bucket/reference/Baits_BED_Files_AgilentV6_REVISED_S07604514_ALLBED_merged_020816_withChr_GRCh38_sorted.bed"
+BED_WU = "s3://ntap-add5-project-tower-bucket/reference/xgen-exome-research-panel-v2-probes-hg3862a5791532796e2eaa53ff00001c1b3c.bed"
+
+
+def generate_datasets(run_number: int = 1) -> list[Dataset]:
     """Generate list of datasets.
 
     Source: https://sagebionetworks.jira.com/browse/WORKFLOWS-538
 
-    This is expecting that the SampleSheet to be run exists in the `prefix` location.
+    Samplesheets: https://www.synapse.org/Synapse:syn74378396
     """
     return [
         Dataset(
+            # JH_batch1 tumors, single-lane
+            # 26 samples, 26 rows, status = 1 (tumor)
             id="syn74378522",
             samplesheet="sarek_samplesheet_JH_batch1_tumor_germline.csv",
             staging_key="samplesheets/Sarek_Process/EAGER-germline/",
             bucket_name="ntap-add5-project-tower-bucket",
             synapse_id_for_output="syn74391336",
-            run_number=1,
-            output_number=1,
-        )
+            institution="JH",
+            run_number=run_number,
+        ),
+        Dataset(
+            # WU_batch1 tumors, single-lane
+            # 26 samples, 26 rows, status = 1 (tumor)
+            id="syn74722658",
+            samplesheet="sarek_samplesheet_WU_batch1_tumor_germline.csv",
+            staging_key="samplesheets/Sarek_Process/EAGER-germline/",
+            bucket_name="ntap-add5-project-tower-bucket",
+            synapse_id_for_output="syn74530464",
+            institution="WU",
+            run_number=run_number,
+        ),
+        Dataset(
+            # WU_batch2 tumors, single-lane
+            # 20 samples, 20 rows, status = 1 (tumor)
+            id="syn74378526",
+            samplesheet="sarek_samplesheet_WU_batch2_tumor_germline.csv",
+            staging_key="samplesheets/Sarek_Process/EAGER-germline/",
+            bucket_name="ntap-add5-project-tower-bucket",
+            synapse_id_for_output="syn74530478",
+            institution="WU",
+            run_number=run_number,
+        ),
+        Dataset(
+            # WU_batch3 blood normals, 2 lanes each
+            # 16 samples, 32 rows, status = 0 (normal)
+            id="syn74378521",
+            samplesheet="sarek_samplesheet_WU_batch3_normal_germline.csv",
+            staging_key="samplesheets/Sarek_Process/EAGER-germline/",
+            bucket_name="ntap-add5-project-tower-bucket",
+            synapse_id_for_output="syn74530480",
+            institution="WU",
+            run_number=run_number,
+        ),
+        Dataset(
+            # WU_batch3 tumors, single-lane
+            # 31 samples, 31 rows, status = 1 (tumor)
+            id="syn74378531",
+            samplesheet="sarek_samplesheet_WU_batch3_tumor_germline.csv",
+            staging_key="samplesheets/Sarek_Process/EAGER-germline/",
+            bucket_name="ntap-add5-project-tower-bucket",
+            synapse_id_for_output="syn74530479",
+            institution="WU",
+            run_number=run_number,
+        ),
+        Dataset(
+            # WU_batch_mismatched tumors, single-lane
+            # 2 samples, 2 rows, status = 1 (tumor)
+            id="syn74385711",
+            samplesheet="sarek_samplesheet_WU_batch_mismatched_tumor_germline.csv",
+            staging_key="samplesheets/Sarek_Process/EAGER-germline/",
+            bucket_name="ntap-add5-project-tower-bucket",
+            synapse_id_for_output="syn74530491",
+            institution="WU",
+            run_number=run_number,
+        ),
     ]
+
 
 def stage_samplesheet(syn: Synapse, dataset: Dataset) -> None:
     """Download the samplesheet from synapse and upload it to S3 in the location where synstage
     is going to grab the file.
-    
+
     Arguments:
         syn: The logged in synapse instance
         dataset: The dataset to stage the samplesheet for
@@ -133,26 +248,27 @@ def stage_samplesheet(syn: Synapse, dataset: Dataset) -> None:
 
 def prepare_synstage_info(dataset: Dataset) -> LaunchInfo:
     """Generate LaunchInfo for nf-synstage.
-    
+
     Arguments:
         dataset: The dataset to stage the samplesheet for
-        
+
     Returns:
         The Nextflow Tower workflow launch specification for synstage step
     """
     return LaunchInfo(
-            run_name=dataset.synstage_run_name,
-            pipeline="Sage-Bionetworks-Workflows/nf-synapse",
-            revision="main",
-            profiles=["sage"],
-            params={
-                "input": dataset.samplesheet_location,
-                "outdir": dataset.staging_location,
-                "entry": "synstage",
-            },
-            workspace_secrets=["SYNAPSE_AUTH_TOKEN"]
-        )
-    
+        run_name=dataset.synstage_run_name,
+        pipeline="Sage-Bionetworks-Workflows/nf-synapse",
+        revision="main",
+        profiles=["sage"],
+        params={
+            "input": dataset.samplesheet_location,
+            "outdir": dataset.staging_location,
+            "entry": "synstage",
+        },
+        workspace_secrets=["SYNAPSE_AUTH_TOKEN"]  # set as workspace secret (not user secret) in Tower
+    )
+
+
 def prepare_sarek_launch_info(dataset: Dataset) -> LaunchInfo:
     """Generate LaunchInfo for nf-core/sarek workflow run.
 
@@ -160,7 +276,7 @@ def prepare_sarek_launch_info(dataset: Dataset) -> LaunchInfo:
         dataset: The dataset to stage the samplesheet for
 
     Returns:
-        The Nextflow Tower workflow launch specification for sarek processing step    
+        The Nextflow Tower workflow launch specification for sarek processing step
     """
     return LaunchInfo(
         run_name=dataset.sarek_run_name,
@@ -171,7 +287,7 @@ def prepare_sarek_launch_info(dataset: Dataset) -> LaunchInfo:
             "input": dataset.staged_samplesheet_location,
             "outdir": dataset.output_directory,
             "wes": True,
-            "intervals": "s3://ntap-add5-project-tower-bucket/reference/Baits_BED_Files_AgilentV6_REVISED_S07604514_ALLBED_merged_020816_withChr_GRCh38_sorted.bed",
+            "intervals": dataset.intervals,
             "igenomes_base": "s3://sage-igenomes/igenomes",
             "genome": "GATK.GRCh38",
             "tools": "strelka",
@@ -181,37 +297,36 @@ def prepare_sarek_launch_info(dataset: Dataset) -> LaunchInfo:
 
 def prepare_synindex_launch_info(dataset: Dataset) -> LaunchInfo:
     """Generate LaunchInfo for nf-synindex workflow run.
-    
+
     Arguments:
         dataset: The dataset to stage the samplesheet for
 
     Returns:
-        The Nextflow Tower workflow launch specification for synindex step    
+        The Nextflow Tower workflow launch specification for synindex step
     """
     return LaunchInfo(
-            run_name=dataset.synindex_run_name,
-            pipeline="Sage-Bionetworks-Workflows/nf-synapse",
-            revision="main",
-            profiles=["sage"],
-            params={
-                "s3_prefix": dataset.output_directory,
-                "parent_id": dataset.synapse_id_for_output,
-                "entry": "synindex",
-            },
-            workspace_secrets=["SYNAPSE_AUTH_TOKEN"]
-        )
+        run_name=dataset.synindex_run_name,
+        pipeline="Sage-Bionetworks-Workflows/nf-synapse",
+        revision="main",
+        profiles=["sage"],
+        params={
+            "s3_prefix": dataset.output_directory,
+            "parent_id": dataset.synapse_id_for_output,
+            "entry": "synindex",
+        },
+        workspace_secrets=["SYNAPSE_AUTH_TOKEN"]  # set as workspace secret (not user secret) in Tower
+    )
 
-async def run_workflows(ops: NextflowTowerOps, dataset: Dataset,step):
+
+async def run_workflows(ops: NextflowTowerOps, dataset: Dataset, step):
     if 'all' in step or 'stage_samplesheet' in step:
         print('staging samplesheet')
         syn = Synapse()
         syn.login()
-        # upload samplesheet to S3
         stage_samplesheet(syn, dataset)
-    
-    if 'all' in step or 'synstage' in step: 
+
+    if 'all' in step or 'synstage' in step:
         print('starting synstage')
-        # stage fastq and updated samplesheetj
         synstage_info = prepare_synstage_info(dataset)
         synstage_run_id = ops.launch_workflow(synstage_info, "spot", ignore_previous_runs=True)
         status = await ops.monitor_workflow(run_id=synstage_run_id, wait_time=60 * 2)
@@ -219,20 +334,18 @@ async def run_workflows(ops: NextflowTowerOps, dataset: Dataset,step):
 
     if 'all' in step or 'process' in step:
         print('starting data processing pipeline')
-        # run sarek pipeline
         sarek_info = prepare_sarek_launch_info(dataset)
         sarek_run_id = ops.launch_workflow(sarek_info, "spot", ignore_previous_runs=True)
         status = await ops.monitor_workflow(run_id=sarek_run_id, wait_time=60 * 2)
         print(status)
 
-
     if 'all' in step or 'synindex' in step:
         print('starting synindex')
-        # index the output files in Synapse
         synindex_info = prepare_synindex_launch_info(dataset)
         synindex_run_id = ops.launch_workflow(synindex_info, "spot", ignore_previous_runs=True)
         status = await ops.monitor_workflow(run_id=synindex_run_id, wait_time=60 * 2)
         print(status)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
